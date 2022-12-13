@@ -1,0 +1,1815 @@
+
+/* START File: ./create-example-tables.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * This is a "Simple Trigger" (https://developers.google.com/apps-script/guides/triggers#onopene).
+ * It adds a custom menu item into the spreadsheet menu.
+ *
+ * @param {Event} e The onOpen event.
+ */
+function onOpen(e) {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Weather Based Marketing')
+    .addItem('Check weather and sync DV360', 'monitorWeatherAndSyncWithDV360')
+    .addItem('Only check weather', 'checkWeather')
+    .addSeparator()
+    .addItem('Create sample config', 'createExampleTable')
+    .addToUi();
+}
+
+/**
+ * Creates a sheet with the example table.
+ * The table is a main configuration source for the AppsScript code.
+ */
+function createExampleTable() {
+  const spreadsheet = SpreadsheetApp.openById(configSpreadsheetId);
+  let sheet = spreadsheet.getSheetByName(configSpreadsheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(configSpreadsheetName);
+  } else {
+    const msg = `ERROR: A sheet with the name "${configSpreadsheetName}" already exists.`
+        + ' Please rename or delete it.';
+
+    SpreadsheetApp.getUi().alert(msg);
+    Logger.log(msg);
+    return;
+  }
+
+  // Populate values
+  sheet.getRange("A1:N3").setValues(getExampleTableValues());
+
+  // Add colors
+  sheet.getRange("A1:N1")
+    .setBackgroundRGB(102, 204, 255)
+    .setFontWeight("bold");
+
+  SpreadsheetApp.getUi().alert("Done");
+}
+
+/**
+ * Returns a default configuration table structure.
+ *
+ * @return {array} The configuration structure.
+ */
+function getExampleTableValues() {
+  return [
+    [
+      'City',
+      'Weather condition',
+      'Activation Formula',
+      'Line Item Id',
+      'Insertion Order Id',
+      'Advertiser ID',
+      'Latitude',
+      'Longitude',
+      'Last Updated',
+      'api:daily.0.clouds',
+      'api:daily.0.rain',
+      'api:daily.0.snow',
+      'api:daily.0.feels_like.!MIN',
+      'api:daily.0.feels_like.!MAX',
+    ],
+    [
+      'Hamburg',
+      'Rain or clouds',
+      '=OR(J2>=50, K2>=10)',
+      '<Integer: Line Item ID>',
+      '<Integer: Insertion Order Id>',
+      '<Integer: Advertiser ID>',
+      '53.55',
+      '10',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+    ],
+    [
+      'Hamburg',
+      'Feels cold',
+      '=N3<0',
+      '<Integer: Line Item ID>',
+      '<Integer: Insertion Order Id>',
+      '<Integer: Advertiser ID>',
+      '53.55',
+      '10',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+    ],
+  ];
+}
+/* END File: ./create-example-tables.gs */
+/* START File: ./classes/dv360.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * DV360 API Wrapper class. Implements DV360 API calls.
+ */
+class DV360 {
+  /**
+   * Set the DV360 wrapper configuration
+   *
+   * @param {string} authToken A token needed to connect to DV360 API
+   */
+  constructor(authToken) {
+    if (!authToken) {
+      throw 'authToken cannot be empty';
+    }
+
+    this.authToken = authToken;
+
+    /**
+     * DV360 Write API Endpoint Prefix
+     * See more: https://developers.google.com/display-video/api/reference/rest
+     */
+    this.dv360EndPointPrefix = 'https://displayvideo.googleapis.com/v1';
+  }
+
+  /**
+   * Make an HTTPS API request using specified auth method (see 'Auth' class)
+   * @param {string} url - API endpoint to be requested
+   * @param {string} method - HTTP(S) method, e.g. GET, PATCH, etc.
+   * @param {string} payload - What should be updated
+   * @returns {JSON} Result of the operation
+   */
+  fetchUrl(url, method, payload) {
+    const params = {
+      muteHttpExceptions: true,
+      method: method || 'get',
+      headers: {
+        'Authorization': 'Bearer ' + this.authToken,
+        'Accept': '*/*'
+      }
+    };
+
+    if (payload) {
+      params.headers['Content-type'] = 'application/json';
+      params.payload = JSON.stringify(payload);
+    }
+
+    const res = UrlFetchApp.fetch(url, params);
+    if(200 != res.getResponseCode() && 204 != res.getResponseCode()) {
+      Logger.log('HTTP code: ' + res.getResponseCode());
+      Logger.log('API error: ' + res.getContentText());
+      Logger.log('URL: ' + url);
+      throw new Error(res.getContentText());
+    }
+
+    return res.getContentText() ? JSON.parse(res.getContentText()) : {};
+  }
+
+  /**
+   * Returns a correct DV360 API status string
+   *
+   * @param {bool} turnOn
+   * @return {string} Status string
+   */
+  apiStatus(turnOn) {
+    return turnOn ? 'ENTITY_STATUS_ACTIVE' : 'ENTITY_STATUS_PAUSED';
+  }
+
+  /**
+   * Change DV360 entity status (Active/Paused) for the specified ID.
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.lineItems
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.insertionOrders
+   * @param {integer} advertiserId - DV360 Advertiser ID
+   * @param {integer} entityId - DV360 Line Item/Insertion Order ID
+   * @param {bool} turnOn - "true" - activate the entity, "false" - deactivate it
+   */
+  switchEntityStatus(advertiserId, entityId, turnOn, entity) {
+    const newStatus = this.apiStatus(turnOn);
+    const updateMask = {
+      'entityStatus': newStatus
+    };
+
+    const url = Utilities.formatString(
+      '%s/advertisers/%s/%s/%s?updateMask=entityStatus',
+      this.dv360EndPointPrefix,
+      advertiserId,
+      entity,
+      entityId
+    );
+
+    this.fetchUrl(url, 'patch', updateMask);
+
+    Logger.log(
+      `* [DV360:switch ${entity}]: DONE, ID: ${entityId} new status ${newStatus}`
+    );
+  }
+
+  /**
+   * Change Insertion Order status (Active/Paused) for the specified IO ID.
+   *
+   * @param {integer} advertiserId - DV360 Advertiser ID
+   * @param {integer} insertionOrderId - DV360 Line Item ID
+   * @param {bool} turnOn - "true" - activate IO, "false" - deactivate IO
+   */
+  switchIOStatus(advertiserId, insertionOrderId, turnOn) {
+    const newStatus = this.switchEntityStatus(
+      advertiserId, insertionOrderId, turnOn, 'insertionOrders'
+    );
+  }
+
+  /**
+   * Change Line Item status (Active/Paused) for the specified LI ID.
+   *
+   * @param {integer} advertiserId - DV360 Advertiser ID
+   * @param {integer} lineItemId - DV360 Line Item ID
+   * @param {bool} turnOn - "true" - activate IO, "false" - deactivate IO
+   */
+  switchLIStatus(advertiserId, lineItemId, turnOn) {
+    const newStatus = this.switchEntityStatus(
+      advertiserId, lineItemId, turnOn, 'lineItems'
+    );
+  }
+
+  /**
+   * Get DV360 entity for the specified ID.
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.lineItems
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.insertionOrders
+   * @param {integer} advertiserId DV360 Advertiser ID
+   * @param {integer} entityId DV360 Line Item/Insertion Order ID
+   * @param {string} entity Entity (e.g. lineItems/insertionOrders), see API refernece 
+   * @returns {Object} Entity object
+   */
+  getEntity(advertiserId, entityId, entity) {
+    const url = Utilities.formatString(
+      '%s/advertisers/%s/%s/%s',
+      this.dv360EndPointPrefix,
+      advertiserId,
+      entity,
+      entityId
+    );
+
+    return this.fetchUrl(url);
+  }
+
+  /**
+   * Get DV360 entity for the specified ID.
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.lineItems
+   * See more: https://developers.google.com/display-video/api/reference/rest/v1/advertisers.insertionOrders
+   * @param {integer} advertiserId DV360 Advertiser ID
+   * @param {integer} entityId DV360 Line Item/Insertion Order ID
+   * @param {string} entity Entity (e.g. lineItems/insertionOrders), see API refernece 
+   * @returns {Object} Entity object
+   */
+  getEntityStatus(advertiserId, entityId, entity) {
+    const e = this.getEntity(advertiserId, entityId, entity);
+    return e.entityStatus;
+  }
+
+  /**
+   * Return true if the entity is active else false
+   * 
+   * @param {int} advertiserId DV360 advertiser ID
+   * @param {int} lineItemId DV360 Line Item ID
+   * @returns {bool}
+   */
+  isLIActive(advertiserId, lineItemId) {
+    return 'ENTITY_STATUS_ACTIVE' == this
+      .getEntityStatus(advertiserId, lineItemId, 'lineItems');
+  }
+
+  /**
+   * Return true if the entity is active else false
+   * 
+   * @param {int} advertiserId DV360 advertiser ID
+   * @param {int} lineItemId DV360 Line Item ID
+   * @returns {bool}
+   */
+  isOIActive(advertiserId, insertionOrderId) {
+    return 'ENTITY_STATUS_ACTIVE' == this
+      .getEntityStatus(advertiserId, insertionOrderId, 'insertionOrders');
+  }
+
+}
+/* END File: ./classes/dv360.gs */
+/* START File: ./classes/sheets.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Helper class to wrap calls to Sheets API.
+ * Sheets API Read/Write usually works faster then reading and writing from/to
+ * spreadsheet directly.
+ */
+class SheetsApi {
+  constructor(spreadsheetId) {
+    /** @type {string} */
+    this.spreadsheetId = spreadsheetId;
+
+    /** @type {null|Object} */
+    this.sheetObj = null;
+
+    /** @type {string} */
+    this.defaultMode = 'FORMULA';
+  }
+
+  /**
+   * Save back to the sheet (retry 3 times in case of error, if after 3 times 
+   * still not written, then throw an exception).
+   *
+   * @param {!Array<!Array<string|number|boolean>>} rows Rows
+   * @param {string} range Range
+   * @param {bool} dontFlush Do not flush the cashe for faster processing
+   *
+   * @return {boolean} True if successful
+   */
+  write(rows, range, dontFlush = false) {
+    const valueRange = Sheets_v4.newValueRange();
+    valueRange.values = rows;
+
+    const options = {
+      valueInputOption: "USER_ENTERED",
+    };
+
+    const maxRetries = 7;
+    for (let i=0; i<maxRetries; i++) {
+      try {
+        Sheets_v4.Spreadsheets.Values
+          .update(valueRange, this.spreadsheetId, range, options);
+        
+        if (!dontFlush) {
+          SpreadsheetApp.flush();
+        }
+  
+        break;
+      } catch (e) {
+        const secs = 5 * (i + 1);
+        Logger.log(e);
+        
+        if (i == maxRetries-1) {
+          throw `Failed to write to sheet after ${maxRetries} retries`;
+        }
+        
+        Logger.log(`Error updating sheet, retrying in ${secs}s`);
+        Utilities.sleep(1000*secs);
+      }
+    }
+  }
+
+  /**
+   * Fetches data from sheet
+   *
+   * @param {string} range A1-Range
+   * @param {string|bool} renderMode Render mode, [more info](https://developers.google.com/sheets/api/reference/rest/v4/ValueRenderOption)
+   *
+   * @return {!Array<!Array<!Object>>}
+   */
+  get(range, renderModeString = false) {
+    if (! this.spreadsheetId) {
+      this.getSheetObject();
+    }
+
+    const maxRetries=7;
+    for (let i=0; i<maxRetries; i++) {
+      try {
+        return Sheets_v4.Spreadsheets.Values.get(
+            this.spreadsheetId,
+            range,
+            {'valueRenderOption': renderModeString || this.defaultMode}
+          )['values'];
+      } catch (e) {
+        const secs = 5 * (i + 1);
+        Logger.log(e);
+        
+        if (i == maxRetries-1) {
+          throw `Failed to read to sheet after ${maxRetries} retries`;
+        }
+        
+        Logger.log(`Error reading sheet, retrying in ${secs}s`);
+        Utilities.sleep(1000*secs);
+      }
+    }
+  }
+
+  /**
+   * Fetches data from one cell from the sheet
+   *
+   * @param {string} row Row number
+   * @param {string} col Column number
+   *
+   * @return {Object}
+   */
+  getCellValue(row, col) {
+    if (!this.sheetObj) {
+      this.getSheetObject();
+    }
+
+    return this.sheetObj.getRange(row, col).getValues()[0][0];
+  }
+
+  /**
+   * Get values for the formulas in the row
+   *
+   * @param {Array} row Data from the sheet
+   * @param {integer} rowNum Row number in the sheet
+   * @param {Array} excludeIdx Do not evaluate these array elements
+   * @returns {Array} Evaluated data
+   */
+  getEvaluated(row, rowNum, excludeIdx) {
+    for (let i=0; i<row.length; i++) {
+      if (
+        excludeIdx.indexOf(i) < 0
+        && 'string' == typeof row[i]
+        && row[i].startsWith('=')
+      ) {
+        row[i] = this.getCellValue(rowNum+1, i+1);
+      }
+    }
+
+    return row;
+  }
+
+  /**
+   * Get a spreadsheet object to perform read/write operations.
+   * Check if specified spreadsheet settings are correct 
+   * and init default sheet object.s
+   * 
+   * @param name Optional. Sheet name.
+   * @return {Object}
+   */
+  getSheetObject(name) {
+    const sheet = SpreadsheetApp.openById(configSpreadsheetId)
+      .getSheetByName(name || configSpreadsheetName);
+    if (!sheet) {
+      throw 'Cannot find spreadsheet with the name: '
+        + (name || configSpreadsheetName);
+    }
+
+    if (!name) {
+      this.sheetObj = sheet;
+    }
+
+    return sheet;
+  }
+
+  /**
+   * Process sheet formulas (force them to be re-evaluated)
+   *
+   * @param {number} row Row number
+   * @param {number} col Column number
+   * @returns {*} The evaluated formula output
+   */
+  forceFormulasEval(row, col) {
+    return this.get(`R${row}C${col}`, 'UNFORMATTED_VALUE')[0][0];
+  }
+}/* END File: ./classes/sheets.gs */
+/* START File: ./classes/config.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * This class contains all the config variables in one place.
+ */
+class Config {
+  /**
+   * Init all the config variables
+   *
+   */
+  constructor() {
+    this.config = {
+      /** 
+       * *Mandatory* configuration param.
+       * First you need to get an OpenWeather API key (aka "appid"):
+       * https://openweathermap.org/appid
+       */
+      'open-weather-api-key': '',
+
+      /** 
+       * *Optional*, Imperial VS. Metric units.
+       * Possible values: "standard" (default, if empty), "metric" and "imperial"
+       */
+      'open-weather-api-units': 'metric',
+
+      /** 
+       * *Optional*, only if you want to use a service account.
+       * If you leave this parameter empty, apps script will use
+       * an active Google account under which you run the apps script. 
+       * For more see: https://cloud.google.com/iam/docs/service-accounts
+       */
+      'service-account': {},
+      
+      /**
+       * *Optional*, spreadsheet ID.
+       * Specify your configuration Spreadsheet ID or use a current Spreadsheet, e.g.:
+       * const configSpreadsheetId = "-1GGwYZP34HHejwrO19cK5r108nQr7FaYfg5YJOcw0jnch4";
+       * OR
+       * const configSpreadsheetId = SpreadsheetApp.getActiveSpreadsheet().getId();
+       */
+      'spreadsheet-id': '',
+
+      /**
+       * *Optional*, sheet (tab) name.
+       * Specify your sheet (tab) name with the IOs/LIs IDs,
+       * e.g. for testing we use "TEST", for production "PROD".
+       * For testing purposes we suggest to use a different DV360 campaign,
+       * so you can specify your test IDs in the "TEST" sheet.
+       */
+      'sheet-name': '',
+
+      // Column mappings
+      'col-line-item-id':       'Line Item Id',
+      'col-insertion-order-id': 'Insertion Order Id',
+      'col-advertiser-id':      'Advertiser ID',
+      'col-lat':                'Latitude',
+      'col-lon':                'Longitude',
+      'col-formula':            'Activation Formula',
+      'col-last-updated':       'Last Updated',
+      'col-api-url':            'Api URL',
+      'col-api-headers':        'Api Headers',
+
+      // Spreadsheet headers
+      'headers': [],
+
+      /**
+       * *Optional*
+       * How often do you want to check and update?
+       * If set to 0, checks and updates will run
+       * each time the script is triggered.
+       * You can use this feature when running into issues
+       * with execution limits.
+       */
+      'hours-between-updates': 0,
+    };
+  }
+
+  /**
+   * Set headers array for further processing
+   *
+   * @param headers Headers array
+   */
+  setHeaders(headers) {
+    this.config.headers = [...headers];
+  }
+
+  /**
+   * Returns the index of the header entity
+   * 
+   * @param {string} name Header notation (from `this.config`) we are looking for.
+   * @param {*} defaultValue Default value if the entry is not found.
+   * @return {integer} Index, if not exists then -1.
+   */
+  getHeaderIndex(name, defaultValue) {
+    const idx = this.config.headers.indexOf(this.config[name]);
+    if (-1 === idx) {
+      if ('undefined' === typeof defaultValue) {
+        throw `ERROR: Column '${name}' not found.`;
+      }
+
+      return defaultValue;
+    }
+
+    return idx;
+  }
+
+  /**
+   * Get headers that start with a specified prefix
+   *
+   * @param {string} prefix Prefix
+   * @returns {Object} List of the headers in the format {'<header wo/prefix>': <column number>}
+   */
+  getHeadersWithPrefix(prefix) {
+    let i = 0;
+    const output = {};
+    for (const header of this.config.headers) {
+      if (header.startsWith(prefix)) {
+        output[ header.substring(prefix.length) ] = i;
+      }
+
+      i++;
+    }
+
+    return output;
+  }
+
+  /**
+   * Get api related headers (those which are in the form "api:<entity1>.<entity2>")
+   *
+   * @returns {Object} List of the api related headers in the format {'<entity1>.<entity2>': <column number>}
+   */
+  getApiHeaders() {
+    return this.getHeadersWithPrefix('api:');
+  }
+
+  /**
+   * Returns the config variable value by its name
+   *
+   * @param {string} name Config variable name
+   * @return {*} Variable value
+   */
+  get(name) {
+    return this.config.hasOwnProperty(name) ? this.config[name] : null;
+  }
+}
+
+// For tests
+if (typeof module !== 'undefined') {
+  module.exports = Config;
+}/* END File: ./classes/config.gs */
+/* START File: ./classes/auth.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+
+/**
+ * This is a wrapper class for handling authentification to DV360 API.
+ * This class can be used to auth also to other Google APIs.
+ */
+class Auth {
+  /**
+   * Set the OAuth configuration.
+   * In order to authorise your DV360 API calls you can:
+   * 1. Use the same Google account as you open the spreadsheet.
+   *   If you chose this approach, you don't need to do pass account.
+   * 2. Use a service account.
+   * This is a service account in JSON format from your GCP project.
+   * How to get a service account credentials from GCP:
+   * https://cloud.google.com/iam/docs/service-accounts
+   *
+   * Service account credentials should be specified in the following JSON format:
+   * {
+   * "type": "this.serviceAccount",
+   * "project_id": "...",
+   * "private_key_id": "...",
+   * "private_key": "...",
+   * "client_email": "...@...gserviceaccount.com",
+   * "client_id": "...",
+   * "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+   * "token_uri": "https://oauth2.googleapis.com/token",
+   * "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+   * "client_x509_cert_url": "..."
+   * }
+   *
+   * @param {Object} account The service account or empty
+   *
+   */
+  constructor(account) {
+    this.serviceAccount = account;
+  }
+
+  /**
+   * Get Auth Token for OAuth authorisation for your service account.
+   * You need this token in order to authorise your DV360 API requests.
+   * See more: https://github.com/gsuitedevs/apps-script-oauth2/blob/master/README.md
+   * See more: https://developers.google.com/apps-script/reference/script/script-app#getOAuthToken()
+   *
+   * @returns {string} OAuth Token
+   */
+  getAuthToken() {
+    if (!this.serviceAccount || !('private_key' in this.serviceAccount)) {
+      return ScriptApp.getOAuthToken();
+    }
+
+    const service = OAuth2.createService("Service Account")
+        .setTokenUrl('https://accounts.google.com/o/oauth2/token')
+        .setPrivateKey(this.serviceAccount.private_key)
+        .setIssuer(this.serviceAccount.client_email)
+        .setSubject(this.serviceAccount.user_email)
+        .setPropertyStore(PropertiesService.getScriptProperties())
+        .setParam('access_type', 'offline')
+        .setScope("https://www.googleapis.com/auth/display-video");
+
+    service.reset();
+    return service.getAccessToken();
+  }
+}
+
+/* END File: ./classes/auth.gs */
+/* START File: ./classes/strategies/dv360.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Class to process DV360 API calls from the spreadsheet
+ */
+class DV360APIStrategy {
+    /**
+     * Update the LI or IO status in DV360 (Activate/Deactivate)
+     * 
+     * @param {Array} headers Spreadsheet headers
+     * @param {Array} data Spreadsheet row data
+     * @returns {Object} JSON output
+     */
+    static process(headers, data, config) {
+        const activate = data[ config.getHeaderIndex('col-formula') ],
+            lineItemId = parseInt(
+                data[ config.getHeaderIndex('col-line-item-id', '') ]
+            ),
+            insertionOrderId = parseInt(
+                data[ config.getHeaderIndex('col-insertion-order-id', '') ]
+            ),
+            advertiserId = parseInt(
+                data[ config.getHeaderIndex('col-advertiser-id') ]
+            );
+        
+        if (advertiserId <= 0) {
+            return;
+        }
+        
+        const auth     = new Auth(config.get('service-account'));
+        const dv360    = new DV360(auth.getAuthToken());
+
+        // Max 3 retries
+        const maxRetries = 3;
+        for (let i=0; i<maxRetries; i++) {
+            try {
+                // Switch Status according to the activation formula value
+                if (!isNaN(lineItemId) && lineItemId > 0) {
+                    dv360.switchLIStatus(advertiserId, lineItemId, activate);
+                } else if (!isNaN(insertionOrderId) && insertionOrderId > 0) {
+                    dv360.switchIOStatus(advertiserId, insertionOrderId, activate);
+                }
+
+                break;
+            } catch (e) {
+                const secs = 5 * (i + 1);
+                Logger.log(`Error updating DV360 API, retrying in ${secs}s`);
+                Logger.log(e);
+                if (i == maxRetries-1) {
+                    throw `Failed to update DV360 API after ${maxRetries} retries`;
+                }
+
+                Utilities.sleep(1000*secs);
+            }
+        }
+    }
+}/* END File: ./classes/strategies/dv360.gs */
+/* START File: ./classes/strategies/formulawatchdog.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Class to check that activation formula value is not empty
+ */
+class FormulaWatchdogStrategy {
+    /**
+     * Check formula
+     * 
+     * @param {Array} headers Spreadsheet headers
+     * @param {Array} data Spreadsheet row data
+     * @param {Config} config Config object
+     * @param {int} rowIdx Row index (for reporting purposes)
+     * @returns {Object} JSON output
+     */
+    static process(headers, data, config, rowIdx) {
+        const activate = data[ config.getHeaderIndex('col-formula') ];
+        
+        if ('' === activate) {
+            Strategy.addErrorMessage(
+                `Activation formula is empty! Row ${rowIdx+1}`
+            );
+        } else if (
+            'string' != typeof activate
+            || '=' !== activate.substring(0, 1)
+        ) {
+            Strategy.addErrorMessage(
+                `Activation formula does not start with "=" (value: "${activate}")!`
+                + ` Row ${rowIdx+1}`
+            );
+        }
+
+        return data;
+    }
+}/* END File: ./classes/strategies/formulawatchdog.gs */
+/* START File: ./classes/strategies/inanyapi.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Class to process Any API calls from the spreadsheet
+ */
+class INAnyAPIStrategy {
+    /**
+     * Fetch the any api URL and return it's content in the JSON format.
+     * 
+     * @param {Array} headers Spreadsheet headers
+     * @param {Array} data Spreadsheet row data
+     * @returns {Object} JSON output
+     */
+    static process(headers, data, config) {
+        const url = data[ config.getHeaderIndex('col-api-url') ];
+        const apiHttpHeaders = data[ config.getHeaderIndex('col-api-headers', null) ];
+        const anyApi = new AnyAPI(url, apiHttpHeaders);
+        
+        const params = Utils.arraysToJson(headers, data);
+        anyApi.setParams(params);
+
+        return anyApi.get();
+    }
+}/* END File: ./classes/strategies/inanyapi.gs */
+/* START File: ./classes/strategies/dv360watchdog.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Class to compare activation formula value with the DV360 status
+ */
+class DV360WatchdogStrategy {
+    /**
+     * Check the LI or IO status in DV360 (is it Activate or Paused)
+     * 
+     * @param {Array} headers Spreadsheet headers
+     * @param {Array} data Spreadsheet row data
+     * @param {Config} config Config object
+     * @param {int} rowIdx Row index (for reporting purposes)
+     * @returns {bool} Status
+     */
+    static process(headers, data, config, rowIdx) {
+        const activate = data[ config.getHeaderIndex('col-formula') ],
+            lineItemId = parseInt(
+                data[ config.getHeaderIndex('col-line-item-id', '') ]
+            ),
+            insertionOrderId = parseInt(
+                data[ config.getHeaderIndex('col-insertion-order-id', '') ]
+            ),
+            advertiserId = parseInt(
+                data[ config.getHeaderIndex('col-advertiser-id') ]
+            );
+        
+        if ('' === activate) {
+            // Empty formula, nothing to do
+            return false;
+        }
+
+        if (
+            advertiserId <= 0 
+            || (
+                (isNaN(lineItemId) || lineItemId <= 0)
+                && (isNaN(insertionOrderId) || insertionOrderId <= 0)
+            )
+        ) {
+            // Nothing to check, since no DV360 entity is not specifed
+            return false;
+        }
+        
+        const auth     = new Auth(config.get('service-account'));
+        const dv360    = new DV360(auth.getAuthToken());
+
+        // Save DV360 status to this variable
+        let dv360StatusActive;
+
+        // Max 3 retries
+        const maxRetries = 3;
+        for (let i=0; i<maxRetries; i++) {
+            try {
+                // Check Status
+                if (!isNaN(lineItemId) && lineItemId > 0) {
+                    dv360StatusActive = dv360.isLIActive(
+                        advertiserId, lineItemId
+                    );
+                } else if (!isNaN(insertionOrderId) && insertionOrderId > 0) {
+                    dv360StatusActive = dv360.isOIActive(
+                        advertiserId, insertionOrderId
+                    );
+                }
+
+                break;
+            } catch (e) {
+                const secs = 5 * (i + 1);
+                Logger.log(`Error requesting DV360 API, retrying in ${secs}s`);
+                Utilities.sleep(1000*secs);
+
+                if (i == maxRetries-1) {
+                    throw `Failed to request DV360 API after ${maxRetries} retries`;
+                }
+            }
+        }
+
+        if (activate !== dv360StatusActive) {
+            Strategy.addErrorMessage(
+                `DV360 status is "${dv360StatusActive}"`
+                + ` but spreadsheet status is "${activate}" (row:${rowIdx+1},`
+                + ` IO:${insertionOrderId}, LI:${lineItemId})`
+            );
+        }
+
+        return true;
+    }
+}/* END File: ./classes/strategies/dv360watchdog.gs */
+/* START File: ./classes/strategies/openweatherapi.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * Class to process OpenWeatherMap API calls from the spreadsheet
+ */
+class OpenWeatherAPIStrategy {
+    /**
+     * Fetch the URL and return it's content in the JSON format.
+     * 
+     * @param {Array} headers Spreadsheet headers
+     * @param {Array} data Spreadsheet row data
+     * @returns {Object} JSON output
+     */
+    static process(headers, data, config) {
+        const apiKey = config.get('open-weather-api-key');
+        if (! apiKey) {
+            throw 'OpenWeather API key cannot be empty. Please put your key' 
+                + ' to the "open-weather-api-key" config section.';
+        }
+
+        const params = {
+            lat: data[ config.getHeaderIndex('col-lat') ],
+            lon: data[ config.getHeaderIndex('col-lon') ],
+            exclude: "minutely,hourly",
+            units: config.get('open-weather-api-units'),
+            appid: apiKey,
+        };
+        
+        const url = "https://api.openweathermap.org/data/2.5/onecall?"
+            + Utils.encodeParameters(params);
+        const anyApi = new AnyAPI(url);
+
+        return anyApi.get();
+    }
+}/* END File: ./classes/strategies/openweatherapi.gs */
+/* START File: ./classes/strategy.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * A storage which contains all the registered strategies.
+ */
+const STRATEGYQUEUE = {
+    'IN': {},
+    'OUT': {},
+};
+
+/**
+ * A storage which contains all error messages.
+ */
+const STRATEGYERRORS = [];
+
+
+/**
+ * Main class to process the spreadsheet by calling the right processor class.
+ */
+class Strategy {
+    /** 
+     * Register a new handler class.
+     * 
+     * @param queueName {string} Decides which queue (IN or OUT)
+     * @param fieldName {string} Handle columns with this name
+     * @param classHandler {class} This class will handle the data processing
+     * @returns {void}
+     */
+    static register(queueName, fieldName, classHandler) {
+        if (!(fieldName in STRATEGYQUEUE[queueName])) {
+            STRATEGYQUEUE[queueName][fieldName] = [];
+        }
+
+        STRATEGYQUEUE[queueName][fieldName].push(classHandler);
+    }
+
+    /** 
+     * Register am array of new handler classes.
+     * 
+     * @param queueName {string} Decides which queue (IN or OUT)
+     * @param handlers {Array} This array contains classes which handle the data 
+     *  processing
+     * @returns {void}
+     */
+    static registerArray(queueName, handlers) {
+        if (!handlers) {
+            return;
+        }
+
+        for (let i in handlers) {
+            const key = Object.keys(handlers[i])[0];
+            this.register(queueName, key, handlers[i][key]);
+        }
+    }
+
+    /** 
+     * Processes the queue and returns processed array of data.
+     * 
+     * @param queueName {string} Decides which queue (IN or OUT)
+     * @param headers {array} List of the header columns from the spreadsheet
+     * @param data {array} The data from the spreadsheet row.
+     * @param idx {int} Row index, for reporting purposes.
+     * @returns {Array} The output of the classHandler.process(...), always of
+     *  the same length as the row in the spreadsheet.
+     */
+    static process(queueName, header, data, config, idx = null) {
+        if (!config) {
+            throw 'ERROR:Strategy.process: Empty `config` variable.';
+        }
+
+        // Copy, since we don't want to change the original data
+        let processedRow = [...data];
+
+        let strategyFound = false;
+        for (const columnName in STRATEGYQUEUE[queueName]) {
+            if (
+                header.indexOf(columnName) > -1
+                && STRATEGYQUEUE[queueName][columnName]
+            ) {
+                strategyFound = true;
+
+                // Looking for the proper processor
+                for (let i in STRATEGYQUEUE[queueName][columnName]) {
+                    const lastUpdatedIdx = config.getHeaderIndex('col-last-updated');
+                    const strategyName = STRATEGYQUEUE[queueName][columnName][i].name;
+
+                    if (!this.strategyAlreadyProcessed(
+                        strategyName,
+                        processedRow[lastUpdatedIdx],
+                        config.get('hours-between-updates')
+                    )) {
+                        const output = STRATEGYQUEUE[queueName][columnName][i]
+                            .process(header, processedRow, config, idx);
+
+                        if (output && 'boolean' !== typeof output) {
+                            processedRow = this
+                                .getProcessedRow(output, processedRow, config);
+                        }
+
+                        processedRow[lastUpdatedIdx] = this
+                            .genLastUpdatedJSON(
+                                strategyName,
+                                processedRow[lastUpdatedIdx]
+                            );
+                    } else {
+                        console.log(
+                            `LOG:Strategy.process: ${strategyName} was already`
+                            + ` processed during last`
+                            + ` ${config.get('hours-between-updates')} hours`
+                        );
+                    }
+                }
+            }
+        }
+
+        if (!strategyFound) {
+            console.log(
+                'LOG:Strategy.process: No handler class is found, nothing to process.',
+                queueName, header, data, STRATEGYQUEUE
+            );
+        }
+
+        return processedRow;
+    }
+
+    /**
+     * Form an array according to the processor output
+     * 
+     * @param {Array|Objecct} output Array or JSON object
+     * @param {Array} processedRow Row data
+     * @param {Config} config Configuration handling
+     * @returns {Array} Processed data
+     */
+    static getProcessedRow(output, processedRow, config) {
+        if (Array.isArray(output)) {
+            processedRow = output;
+        } else {
+            // This is the JSON case
+            output = JSON.parse(output);
+
+            // Extract all "api:" data points (aka "api notation")
+            const apiHeaders = config.getApiHeaders();
+            for (let apiHeader in apiHeaders) {
+                processedRow[apiHeaders[apiHeader]] = this
+                    .getValueFromJSON(apiHeader, output);
+            }
+        }
+
+        return processedRow;
+    }
+
+    /**
+     * Returns TRUE if strategy is already processed, else FALSE
+     * 
+     * @param {string} strategyName Strategy name
+     * @param {string} lastUpdatedJSON Value of the "Last Updated", in JSON format
+     * @param {int} hoursBetweenUpdates Hours between updates
+     * @returns {bool}
+     */
+    static strategyAlreadyProcessed(
+        strategyName,
+        lastUpdatedJSON,
+        hoursBetweenUpdates
+    ) {
+        const lastUpdated = this.getLastUpdated(
+            strategyName,
+            lastUpdatedJSON
+        );
+        const currentDateTime = new Date();
+
+        return !this.isDateOlderThanNHours(
+            currentDateTime,
+            lastUpdated,
+            hoursBetweenUpdates
+        );
+    }
+
+    /**
+     * Extract and return the last updated date for the specific strategy
+     * 
+     * @param {string} strategyName Strategy name
+     * @param {strng} json Value of the "Last Updated", in JSON format
+     * @returns {string} Return empty string if date is not found
+     */
+    static getLastUpdated(strategyName, json) {
+        json = this.jsonParseSafe(json);
+        return strategyName in json ? json[strategyName] : '';
+    }
+
+    /**
+     * Safe way to parse JSON, not triggering exception.
+     * 
+     * @param {string} json JSON to parse
+     * @returns {Object} JSON Object
+     */
+    static jsonParseSafe(json) {
+        try {
+            return JSON.parse(json);
+        } catch (e) {
+            return {};
+        }
+    }
+
+    /**
+     * Generate the correct JSON string with the updated date/time of the last 
+     *  update.
+     * 
+     * @param {string} strategyName Strategy name
+     * @param {string} json JSON string
+     * @returns {string}
+     */
+    static genLastUpdatedJSON(strategyName, json) {
+        json = this.jsonParseSafe(json);
+        json[strategyName] = (new Date()).toISOString();
+
+        return JSON.stringify(json);
+    }
+
+    /**
+     * Check if the lastUpdated is older then `currentDateTime - hoursBetweenUpdates`
+     * 
+     * @param {string|Date} currentDateTime Current date
+     * @param {string|Date} lastUpdated Date of the last update
+     * @param {int} hoursBetweenUpdates Number of hours between events. If 0, then
+     *  always will return true 
+     * @param {float} errorDiff For apps script scheduler (e.g. daily 8AM-9AM) 
+     *  which doesn't run at the very same hour and minute as the last run
+     * @returns {bool} TRUE if it is older else FALSE
+     */
+    static isDateOlderThanNHours(
+        currentDateTime,
+        lastUpdated,
+        hoursBetweenUpdates,
+        errorDiff = 0.17
+    ) {
+        hoursBetweenUpdates = parseInt(hoursBetweenUpdates);
+        if (!hoursBetweenUpdates || !lastUpdated) {
+            return true;
+        }
+
+        if (!currentDateTime instanceof Date) {
+            currentDateTime = new Date(currentDateTime);
+        }
+
+        if (!(lastUpdated instanceof Date)) {
+            lastUpdated = new Date(lastUpdated);
+        }
+
+        const diffHours = (currentDateTime - lastUpdated) / 1000 / 60 / 60;
+        return 0 < diffHours && diffHours > (hoursBetweenUpdates - errorDiff);
+    }
+
+    /**
+     * Get JSON entry value for the provided path (similar to XPath in XML)
+     *
+     * @param {string} path Format "<entity>.<entity>.<array index>.<entity>"
+     * @param {JSON} json JSON or JavaScript Object
+     * @returns {*|null} Value from JSON or null if value does not exist
+     */
+    static getValueFromJSON(path, json) {
+        let tmpJson = json,
+            val = null;
+
+        for (const part of path.split('.')) {
+            if (part.startsWith('!')) {
+                return this.getAgregatedValueFromJSON(part.substring(1), tmpJson);
+            }
+
+            let tmpVal;
+            const intVal = parseInt(part);
+            if (intVal && intVal in tmpJson) {
+                tmpVal = tmpJson[intVal];
+            } else if (tmpJson.hasOwnProperty(part)) {
+                tmpVal = tmpJson[part];
+            } else {
+                break;
+            }
+
+            const typeOf = typeof tmpVal;
+            if ('string' == typeOf || 'number' == typeOf) {
+                return tmpVal;
+            } else {
+                tmpJson = tmpVal;
+            }
+        }
+
+        return val;
+    }
+
+    /**
+     * Get aggregated value (e.g. MAX, MIN, etc.) from JSON entry values.
+     *
+     * @param {string} aggFunction Aggregation function (now only MIN and MAX function are supported)
+     * @param {JSON} json JSON or JavaScript Object
+     * @returns {number} Agregated value from JSON
+     */
+    static getAgregatedValueFromJSON(aggFunction, json) {
+        switch (aggFunction.toLowerCase()) {
+            case 'min':
+                return Math.min.apply(Math, Object.values(json));
+
+            case 'max':
+                return Math.max.apply(Math, Object.values(json));
+
+            default:
+                throw `Aggregation function "${aggFunction}" is not supported`;
+        }
+    }
+
+    /**
+     * Add error message to the list of the errors.
+     * 
+     * @param {string} msg Error message.
+     */
+    static addErrorMessage(msg) {
+        console.log('ERROR:addErrorMessage: %s', msg);
+        STRATEGYERRORS.push(msg);
+    }
+
+    /**
+     * Returns a formated list of error messages.
+     * 
+     * @returns {string}
+     */
+    static getErrorMessages() {
+        return STRATEGYERRORS.join("\n");
+    }
+}
+
+// For tests
+if (typeof module !== 'undefined') {
+    module.exports = Strategy;
+}/* END File: ./classes/strategy.gs */
+/* START File: ./classes/utils.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+/**
+ * This class contains different utility functional
+ */
+class Utils {
+  /**
+   * Take an object and transform it to a URL safe parameter string
+   *
+   * @param {object} params
+   * @returns {string}
+   */
+  static encodeParameters(params) {
+    return Object.keys(params).map(function(key) {
+      return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
+    }).join('&');
+  }
+
+  /**
+   * Get timestamp of [daysBack] days ago in microseconds
+   *
+   * @param {number} daysBack
+   * @returns {string}
+   */
+  static getPastTimestamp(daysBack) {
+    let daysAgoMillis = new Date().getTime() - daysBack * 24 * 60 * 60 * 1000;
+
+    return (Math.floor(daysAgoMillis / 1000)).toString();
+  }
+
+  /**
+   * Combine two arrays of the same size to the JSON.
+   * 
+   * @param {Array} a1 Array for keys
+   * @param {Array} a2 Array for values
+   * @returns {Object} Json { a1.element: a2.element, ... }
+   */
+  static arraysToJson(a1, a2) {
+    const result = {};
+    a1.forEach((key, i) => { result[ key ] = a2[ i ] });
+
+    return result;
+  }
+
+  /**
+   * Logging of the successful processing (in CSV format for the further analysis).
+   * `[ROW DATA]` is just a label, so the logs can be filtered out by it.
+   * 
+   * @param {Array} row The spreadsheet row
+   * @param {string} label A lable to be added to the log message
+   * @returns {void}
+   */
+  static logRowData(row, label='[ROW DATA]') {
+    row.push(label);
+    Logger.log(row.join(','));
+  }
+}
+
+// For tests
+if (typeof module !== 'undefined') {
+  module.exports = Utils;
+}/* END File: ./classes/utils.gs */
+/* START File: ./classes/anyapi.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+const ANYAPICACHE = {};
+
+/**
+ * Main class to process API calls
+ */
+class AnyAPI {
+    /**
+     * Constructor
+     *
+     * @param {string} url API Endpoint
+     * @param {Object} headers HTTP Headers for the api call
+     */
+    constructor(url, headers = '') {
+        this.url = url;
+        this.headers = headers;
+
+        // Placeholders in the URL & headers
+        this.placeholderStart = '{{';
+        this.placeholderEnd   = '}}';
+    }
+
+    /**
+     * Set url and http header params
+     *
+     * @param {Object} params URL and Headers params {name => value, ...}
+     * @return {void}
+     */
+    setParams(params) {
+        for (const p in params) {
+            const pattern = this.placeholderStart + p + this.placeholderEnd;
+
+            this.url = this.url.replace(pattern, params[p]);
+            this.headers = this.headers.replace(pattern, params[p]);
+        }
+    }
+
+    /**
+     * Get API response JSON.
+     * Bad test coverage since `UrlFetchApp.fetch` is Apps Script specific.
+     *
+     * @returns {Object}
+     */
+    get() {
+        if (!this.url) {
+            throw 'API URL cannot be empty.';
+        }
+
+        // Headers are optional
+        this.headers = this.headers || '{}';
+
+        const cacheKey = this.url + '|' + JSON.stringify(this.headers);
+        if (! (cacheKey in ANYAPICACHE)) {
+            ANYAPICACHE[cacheKey] = this
+                .fetchWithRetries(this.url, JSON.parse(this.headers));
+        }
+
+        return ANYAPICACHE[cacheKey];
+    }
+
+    /**
+     * Returns the result of the http request or throws error if not able to 
+     *  fetch after `maxRetries` retries.
+     * 
+     * @param {string} url Url
+     * @param {Object} params Additional HTTP params
+     * @param {int} maxRetries Number of retries
+     * @returns {Object} JSON
+     */
+    fetchWithRetries(url, params, maxRetries = 3) {
+        for (let i=0; i<maxRetries; i++) {
+            try {
+                const res = UrlFetchApp.fetch(url, params);
+                if(200 != res.getResponseCode() && 204 != res.getResponseCode()) {
+                    Logger.log(
+                        'AnyAPI:fetchWithRetries: Failed to fetch url "%s",'
+                            + ' params "%s", HTTP code: "%s", context: "%s"',
+                        url, params, res.getResponseCode(), res.getContentText()
+                    );
+
+                    throw 'AnyAPI:fetchWithRetries: Failed to fetch url';
+                } else {
+                    return res.getContentText();
+                }
+            } catch (e) {
+                const secs = 5 * (i + 1);
+                Logger.log(e);
+                if (i == maxRetries-1) {
+                    throw `Failed to fetch API after ${maxRetries} retries`;
+                }
+                
+                Logger.log(`Error fetching the API, retrying in ${secs}s`);
+                Utilities.sleep(1000*secs);
+            }
+        }
+    }
+
+    /**
+     * Add something to the cache
+     * 
+     * @param {*} key Key
+     * @param {*} value Value
+     */
+    setCache(key, value) {
+        ANYAPICACHE[key] = value;
+    }
+}
+
+// For tests
+if (typeof module !== 'undefined') {
+    module.exports = AnyAPI;
+}/* END File: ./classes/anyapi.gs */
+/* START File: ./main.gs */
+/**
+    Copyright 2020 Google LLC
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+ */
+
+// Init configuration handling
+const config = new Config();
+
+// Init globally used variables
+const configSpreadsheetId = config.get('spreadsheet-id')
+    || SpreadsheetApp.getActiveSpreadsheet().getId();
+const configSpreadsheetName = config.get('sheet-name')
+    || "Triggers";
+
+/**
+ * Main entry point for the spreadsheet processing.
+ * 
+ * @param {Array} inQueue Process this array of strategies as "IN" list.
+ * @param {Array} outQueue Process this array of strategies as "OUT" list.
+ */
+function main(inQueue, outQueue = []) {
+    if (
+        (!inQueue || !Array.isArray(inQueue) || !inQueue.length)
+        && (!outQueue || !Array.isArray(outQueue) || !outQueue.length)
+    ) {
+        throw 'ERROR:main: Please specify "inQueue" or "outQueue"'
+            + ' (should be at least one non empty array).';
+    }
+
+    const sheetsApi = new SheetsApi(configSpreadsheetId);
+    sheetsApi.getSheetObject();
+
+    Strategy.registerArray('IN', inQueue);
+    if (outQueue && outQueue.length) {
+        Strategy.registerArray('OUT', outQueue);
+    }
+
+    // Get all rows from the sheet.
+    // If `outQueue` is not empty, we don't evaluate formulas when we read the sheet.
+    const rows = sheetsApi.get(configSpreadsheetName);
+
+    // Pre-process sheet headers
+    const sheetHeaders = rows[0];
+    config.setHeaders(sheetHeaders);
+
+    // These formulas should be evaluated only once (on the activation step)
+    const excludeEval = [config.getHeaderIndex('col-formula')];
+
+    // Find the "activation formula" index
+    const formulaIdx = config.getHeaderIndex('col-formula');
+
+    // Iterate over the sheet data
+    for (let i = 1; i < rows.length; i++) {
+        Logger.log(`LOG:main: Processing row #${i+1}`);
+
+        // We need to make sure that `row` contains the values, not formulas.
+        let row = sheetsApi.getEvaluated(rows[i], i, excludeEval);
+
+        if (inQueue && inQueue.length) {
+            // Process "IN" queue (e.g. AnyAPI and OpenWeatherAPI).
+            let newRow = Strategy.process('IN', sheetHeaders, row, config, i);
+    
+            // If nothing changed, then don't write back to the sheet
+            if (JSON.stringify(newRow) !== JSON.stringify(row)) {
+                sheetsApi.write(
+                    [newRow],
+                    configSpreadsheetName + '!A' + (i + 1),
+                    !(outQueue && outQueue.length)
+                );
+    
+                row = [...newRow];
+            }
+        }
+
+        // If out queue is not empty, then evaluate the activation formula
+        // and process the out queue.
+        if (outQueue && outQueue.length) {
+            const formulaValue = row[formulaIdx];
+            row[formulaIdx] = sheetsApi.forceFormulasEval(i + 1, formulaIdx + 1);
+
+            // Run all OUT processors (e.g. change DV360 status)
+            newRow = Strategy.process('OUT', sheetHeaders, row, config, i);
+            newRow[formulaIdx] = formulaValue;
+
+            // If nothing changed, then don't write back to the sheet
+            if (JSON.stringify(newRow) !== JSON.stringify(row)) {
+                sheetsApi.write(
+                    [newRow],
+                    configSpreadsheetName + '!A' + (i + 1),
+                    true
+                );
+
+                row = newRow;
+            }
+        }
+
+        Utils.logRowData(row);
+    }
+
+    // Save all cached write requests
+    SpreadsheetApp.flush();
+
+    // Check if there are errors to report
+    const msgs = Strategy.getErrorMessages();
+    if (msgs) {
+        throw msgs;
+    }
+}
+
+/**
+ * Will monitor the weather and sync the LI/IO status with DV360 accordingly.
+ * 
+ * @param {bool|*} onlyInQueue If true, then no "out queue" will be processed.  
+ */
+function monitorWeatherAndSyncWithDV360(onlyInQueue = false) {
+    if ('boolean' !== typeof onlyInQueue) {
+        onlyInQueue = false;
+    }
+
+    // Register sheet processors
+    const inQueue = [
+        { [config.get('col-lat')]: OpenWeatherAPIStrategy },
+    ];
+
+    const outQueue = onlyInQueue
+        ? []
+        : [{ [config.get('col-advertiser-id')]: DV360APIStrategy }];
+
+    return main(inQueue, outQueue);
+}
+
+/**
+ * Will check the weather. It will NOT sync with the DV360!
+ */
+function checkWeather() {
+    return monitorWeatherAndSyncWithDV360(true);
+}
+
+/**
+ * Will check the "any api". It will NOT sync with the DV360!
+ */
+function checkApi() {
+    return monitorAnyApiAndSyncWithDV360(true);
+}
+
+/**
+ * Will monitor "any api" and sync the LI/IO status with DV360 accordingly.
+ * 
+ * @param {bool|*} onlyInQueue If true, then no "out queue" will be processed.  
+ */
+function monitorAnyApiAndSyncWithDV360(onlyInQueue = false) {
+    if ('boolean' !== typeof onlyInQueue) {
+        onlyInQueue = false;
+    }
+
+    // Register sheet processors
+    const inQueue = [
+        { [config.get('col-api-url')]: INAnyAPIStrategy },
+    ];
+
+    const outQueue = onlyInQueue
+        ? []
+        : [{ [config.get('col-advertiser-id')]: DV360APIStrategy }];
+
+    return main(inQueue, outQueue);
+}
+
+/**
+ * Only sync wth DV360.
+ */
+function syncWithDV360() {
+    return main(
+        [], 
+        [{ [config.get('col-advertiser-id')]: DV360APIStrategy }]
+    );
+}
+
+/**
+ * Check if the spreadsheet is compliant.
+ */
+function watchdog() {
+    return main(
+        [ { [config.get('col-formula')]: FormulaWatchdogStrategy }, ],
+        [ { [config.get('col-advertiser-id')]: DV360WatchdogStrategy }, ]
+    );
+}/* END File: ./main.gs */
